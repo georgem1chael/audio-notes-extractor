@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Secrets: API keys go in your environment or a local .env, never in git
+.env
+
+# Recordings and what the tool generates from them stay on your machine
+*.wav
+*.mp3
+*.m4a
+*.transcript.json
+*.notes.json
+*.notes.md
+
+# macOS
+.DS_Store
