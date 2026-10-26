@@ -1,1 +1,2 @@
 pydantic>=2.7,<3
+openai-whisper>=20250625
