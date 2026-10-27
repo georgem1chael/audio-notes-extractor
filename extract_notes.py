@@ -3,15 +3,18 @@
 Pipeline: audio -> Whisper transcript -> Claude -> notes saved as JSON + Notion.
 """
 
+import json
 import shutil
 from pathlib import Path
 from types import ModuleType
 
+import ollama
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 SUPPORTED_FORMATS = {".wav", ".mp3", ".m4a"}
 DEFAULT_WHISPER_MODEL = "base"
-
+DEFAULT_NOTES_MODEL = "gemma4:12b"
+MAX_NOTES_TOKENS = 8000
 
 # Errors
 #
@@ -33,6 +36,10 @@ class WhisperUnavailableError(NotesError):
 
 class TranscriptionError(NotesError):
     """Whisper ran but failed, or heard nothing usable."""
+
+
+class NotesGenerationError(NotesError):
+    """The local model couldn't be reached or didn't return usable notes."""
 
 
 # What Whisper gives us
@@ -171,3 +178,69 @@ def transcribe(
         raise TranscriptionError(f"Whisper failed on {audio_path.name}: {last_line}") from e
 
     return parse_whisper_result(result)
+
+
+SYSTEM_PROMPT = """\
+You turn lecture transcripts into study notes for a student revising for exams.
+
+The transcript comes from automatic speech recognition, so some words are misheard \
+(for example "free" instead of "three"). Fix obvious mistakes from the context, but \
+only write down what the tutor actually said: never add facts, examples or deadlines \
+that are not in the lecture.
+
+Each line of the transcript starts with the time it was said, as [HH:MM:SS]. Use \
+those times for each topic's starts_at.
+
+Write the notes in the same language as the lecture."""
+
+
+def format_timestamp(seconds: float) -> str:
+    """Turn a number of seconds, like 3725.5, into "01:02:05"."""
+    hours, rest = divmod(int(seconds), 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def build_prompt(transcript: Transcript) -> str:
+    """The message for the model: the JSON it must reply with, then the timestamped transcript."""
+    schema = json.dumps(LectureNotes.model_json_schema(), indent=2)
+    lines = [f"[{format_timestamp(s.start)}] {s.text}" for s in transcript.segments]
+    text = "\n".join(lines) or transcript.text
+    return f"Reply with JSON that follows this schema:\n{schema}\n\nLecture transcript:\n{text}"
+
+
+def generate_notes(
+    transcript: Transcript, model: str = DEFAULT_NOTES_MODEL, attempts: int = 3
+) -> LectureNotes:
+    """Ask the local model for study notes, trying again if a reply comes back unusable."""
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": build_prompt(transcript)},
+    ]
+    problem = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            response = ollama.chat(
+                model=model,
+                messages=messages,
+                format=LectureNotes.model_json_schema(),
+                options={"temperature": 0, "num_predict": MAX_NOTES_TOKENS},
+                think=False,
+            )
+        except ConnectionError as e:
+            raise NotesGenerationError("Ollama isn't running. Open the Ollama app and try again.") from e
+        except ollama.ResponseError as e:
+            if e.status_code == 404:
+                raise NotesGenerationError(f"{model} isn't downloaded. Run: ollama pull {model}") from e
+            raise NotesGenerationError(f"Ollama error: {e.error}") from e
+
+        if response.done_reason == "length":
+            problem = f"the reply ran past {MAX_NOTES_TOKENS} tokens"
+        else:
+            try:
+                return LectureNotes.model_validate_json(response.message.content)
+            except ValidationError as e:
+                problem = f"the reply didn't match the notes format ({e.error_count()} problems)"
+        print(f"Attempt {attempt} of {attempts} failed: {problem}")
+
+    raise NotesGenerationError(f"No usable notes after {attempts} attempts: {problem}")
