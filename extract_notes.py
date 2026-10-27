@@ -63,11 +63,11 @@ class Transcript(BaseModel):
     segments: list[TranscriptSegment] = Field(default_factory=list)
 
 
-# What we ask Claude to give us
+# What we ask the model to give us
 #
-# Claude will see these field descriptions, so they double as instructions.
+# The model sees these field descriptions (build_prompt includes the schema), so they double as instructions.
 # A field typed `str | None` with no default must be present but may be null:
-# Claude has to say "unknown" explicitly rather than quietly leave it out.
+# The model has to say "unknown" explicitly rather than quietly leave it out.
 
 
 class _Strict(BaseModel):
@@ -180,6 +180,8 @@ def transcribe(
     return parse_whisper_result(result)
 
 
+# Notes
+
 SYSTEM_PROMPT = """\
 You turn lecture transcripts into study notes for a student revising for exams.
 
@@ -244,3 +246,48 @@ def generate_notes(
         print(f"Attempt {attempt} of {attempts} failed: {problem}")
 
     raise NotesGenerationError(f"No usable notes after {attempts} attempts: {problem}")
+
+
+# Saving
+
+def section(title: str, items: list[str]) -> list[str]:
+    """Markdown lines for one section: a heading, then its items (or a note that there are none)."""
+    return [f"## {title}", ""] + (items or ["*None mentioned.*"]) + [""]
+
+
+def render_markdown(notes: LectureNotes, source: str) -> str:
+    """Lay the notes out as Markdown, which Notion can import as a page."""
+    concepts = [f"- **{c.term}**: {c.explanation}" for c in notes.key_concepts]
+    assignments = [f"- [ ] {a.task}" + (f" (due {a.due})" if a.due else "") for a in notes.assignments]
+    hints = [f"- {hint}" for hint in notes.exam_hints]
+    questions = [f"{n}. {q}" for n, q in enumerate(notes.review_questions, start=1)]
+
+    lines = [f"# {notes.title}", "", f"*Notes from {source}*", ""]
+    lines += section("Summary", [notes.summary])
+    lines += section("Key concepts", concepts)
+    lines += ["## Topics", ""]
+    for topic in notes.topics:
+        when = f" ({topic.starts_at})" if topic.starts_at else ""
+        lines += [f"### {topic.heading}{when}", ""] + [f"- {point}" for point in topic.points] + [""]
+    lines += section("Assignments", assignments)
+    lines += section("Exam hints", hints)
+    lines += section("Review questions", questions)
+    return "\n".join(lines)
+
+
+def load_or_transcribe(audio_path: Path, whisper_model: str = DEFAULT_WHISPER_MODEL, language: str | None = None) -> Transcript:
+    """Reuse the transcript saved next to the recording, or run Whisper and save one."""
+    saved = audio_path.with_suffix(".transcript.json")
+    if saved.exists():
+        print(f"Using the saved transcript {saved.name} (delete it to transcribe again)")
+        return Transcript.model_validate_json(saved.read_text(encoding="utf-8"))
+    transcript = transcribe(audio_path, whisper_model, language)
+    saved.write_text(transcript.model_dump_json(indent=2), encoding="utf-8")
+    return transcript
+
+
+def save_notes(notes: LectureNotes, audio_path: Path) -> Path:
+    """Write the notes as Markdown next to the recording, and return the new file's path."""
+    path = audio_path.with_suffix(".notes.md")
+    path.write_text(render_markdown(notes, audio_path.name), encoding="utf-8")
+    return path
