@@ -10,3 +10,4 @@ Pipeline: audio (`.wav`, `.mp3`, `.m4a`) → Whisper transcript → Claude → n
 
 - Python 3.10 or newer
 - ffmpeg, for reading audio: `brew install ffmpeg` on macOS
+- [Ollama](https://ollama.com), running, with the notes model downloaded: `ollama pull gemma4:12b`
