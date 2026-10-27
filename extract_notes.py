@@ -1,6 +1,6 @@
 """Turn a lecture recording into structured study notes.
 
-Pipeline: audio -> Whisper transcript -> Claude -> notes saved as JSON + Notion.
+Pipeline: audio -> Whisper transcript (on the Mac's GPU) -> a local model through Ollama -> Markdown notes.
 """
 
 import argparse
@@ -14,14 +14,20 @@ import ollama
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 SUPPORTED_FORMATS = {".wav", ".mp3", ".m4a"}
-DEFAULT_WHISPER_MODEL = "base"
+DEVICES = ["mac", "nvidia", "cpu"]
+# The same Whisper model, large-v3-turbo, by the name each package knows it
+MAC_WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
+WHISPER_MODEL = "turbo"
 DEFAULT_NOTES_MODEL = "gemma4:12b"
 MAX_NOTES_TOKENS = 8000
+# How much the model reads at once: the prompt plus its reply. An hour of lecture is about
+# 16,000 tokens. Ollama's own default depends on the machine, and can be as low as 4,096.
+CONTEXT_TOKENS = 32768
 
 # Errors
 #
-# Each kind of failure gets its own exception class. Later, the CLI will
-# turn each one into a clear message instead of a long traceback.
+# Each kind of failure gets its own exception class. The CLI turns each
+# one into a clear message instead of a long traceback.
 
 
 class NotesError(Exception):
@@ -33,7 +39,7 @@ class AudioFileError(NotesError):
 
 
 class WhisperUnavailableError(NotesError):
-    """openai-whisper or ffmpeg is not installed."""
+    """mlx-whisper, faster-whisper or ffmpeg is not installed."""
 
 
 class TranscriptionError(NotesError):
@@ -77,11 +83,13 @@ class _Strict(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+
 class Concept(_Strict):
     """A term or idea the lecture introduced or relied on."""
 
     term: str = Field(description="The name of the concept, as the tutor used it.")
     explanation: str = Field(description="What it means, in one or two plain sentences a student could revise from.")
+
 
 class Topic(_Strict):
     """One part of the lecture, in the order it was taught."""
@@ -90,23 +98,28 @@ class Topic(_Strict):
     starts_at: str | None = Field(description="Where this part begins in the recording, as HH:MM:SS; null if unclear.")
     points: list[str] = Field(description="The main points, examples and explanations from this part, one per item.")
 
+
 class Assignment(_Strict):
     """Work the tutor set: homework, reading, or preparation for next time."""
 
     task: str = Field(description="What to do, e.g. 'Read chapter 4' or 'Finish exercise sheet 3'.")
     due: str | None = Field(description="Deadline as stated (e.g. 'next Tuesday'); null if none was given.")
 
+
 class LectureNotes(_Strict):
     """Study notes for one lecture."""
 
-    title: str = Field(min_length=1, description="A short title for the lecture, 3-8 words, e.g. 'Database normalization'.")
+    title: str = Field(
+        min_length=1,
+        description="A short title for the lecture, 3-8 words, e.g. 'Database normalization'.",
+    )
     summary: str = Field(
         min_length=1,
         description="3-6 sentences: what the lecture covered and how its parts fit together.",
     )
     key_concepts: list[Concept]
     topics: list[Topic] = Field(min_length=1, description="The lecture's parts, in the order they were taught.")
-    assignments: list[Assignment]
+    assignments: list[Assignment] = Field(description="Only work the tutor actually set; empty if they set none.")
     exam_hints: list[str] = Field(
         description="Anything the tutor stressed as important or likely to be examined, close to their own words."
     )
@@ -133,15 +146,20 @@ def validate_audio_path(path: Path) -> Path:
     return path
 
 
-def load_whisper() -> ModuleType:
-    """Import Whisper, or explain how to install whatever is missing."""
+def load_whisper(device: str) -> ModuleType:
+    """Import the Whisper package for `device`, or explain how to install whatever is missing.
+
+    On a Mac, mlx-whisper runs Whisper on the GPU. On nvidia and cpu, faster-whisper does.
+    """
     try:
-        import whisper
+        if device == "mac":
+            import mlx_whisper as whisper
+        else:
+            import faster_whisper as whisper
     except ImportError as e:
-        raise WhisperUnavailableError("Whisper is not installed. Run: pip install openai-whisper") from e
-    if not hasattr(whisper, "load_model"):
-        raise WhisperUnavailableError("This 'whisper' is the wrong package. Install openai-whisper instead.")
-    if shutil.which("ffmpeg") is None:
+        package = "mlx-whisper" if device == "mac" else "faster-whisper"
+        raise WhisperUnavailableError(f"{package} is not installed. Run: pip install {package}") from e
+    if device == "mac" and shutil.which("ffmpeg") is None:
         raise WhisperUnavailableError("ffmpeg not found; Whisper needs it to read audio. Run: brew install ffmpeg")
     return whisper
 
@@ -160,21 +178,30 @@ def parse_whisper_result(result: dict) -> Transcript:
     return Transcript(text=text, language=result.get("language"), segments=segments)
 
 
-def transcribe(
-    audio_path: Path, whisper_model: str = DEFAULT_WHISPER_MODEL, language: str | None = None
-) -> Transcript:
+def run_faster_whisper(faster_whisper: ModuleType, audio_path: Path, device: str, language: str | None) -> dict:
+    """Transcribe with faster-whisper, and return the result shaped like mlx-whisper's."""
+    if device == "nvidia":
+        model = faster_whisper.WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
+    else:
+        model = faster_whisper.WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+    segments, info = model.transcribe(str(audio_path), language=language, log_progress=True)
+    segments = [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
+    return {"language": info.language, "segments": segments}
+
+
+def transcribe(audio_path: Path, device: str, language: str | None = None) -> Transcript:
     """Run Whisper on an audio file and return what it heard."""
     validate_audio_path(audio_path)
-    whisper = load_whisper()
+    whisper = load_whisper(device)
 
     try:
-        model = whisper.load_model(whisper_model)
-    except Exception as e:  # unknown model name, failed download, damaged model file
-        raise TranscriptionError(f"Could not load Whisper model '{whisper_model}': {e}") from e
-
-    try:
-        result = model.transcribe(str(audio_path), language=language, fp16=False, verbose=False)
-    except Exception as e:  # ffmpeg couldn't decode the file, or Whisper itself failed
+        if device == "mac":
+            result = whisper.transcribe(
+                str(audio_path), path_or_hf_repo=MAC_WHISPER_MODEL, language=language, verbose=False
+            )
+        else:
+            result = run_faster_whisper(whisper, audio_path, device, language)
+    except Exception as e:  # failed model download, unreadable audio, missing NVIDIA libraries, or Whisper failed
         # ffmpeg's errors run to dozens of lines; the last one says what went wrong.
         last_line = str(e).strip().splitlines()[-1] if str(e).strip() else repr(e)
         raise TranscriptionError(f"Whisper failed on {audio_path.name}: {last_line}") from e
@@ -192,10 +219,14 @@ The transcript comes from automatic speech recognition, so some words are mishea
 only write down what the tutor actually said: never add facts, examples or deadlines \
 that are not in the lecture.
 
-Each line of the transcript starts with the time it was said, as [HH:MM:SS]. Use \
-those times for each topic's starts_at.
+Cover the whole lecture: start a new topic whenever the tutor moves on to something \
+new, and keep worked examples with their numbers.
 
-Write the notes in the same language as the lecture."""
+Each line of the transcript is one minute of the lecture and starts with that \
+minute's time, as [HH:MM:SS]. Use those times for each topic's starts_at.
+
+Write the notes in Greek, but keep technical terms in English, the way the tutor \
+says them (for example spam, precision, recall)."""
 
 
 def format_timestamp(seconds: float) -> str:
@@ -205,11 +236,18 @@ def format_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
+def group_by_minute(segments: list[TranscriptSegment]) -> str:
+    """One line per minute of lecture, starting with that minute's time, like "[00:08:00] ..."."""
+    minutes: dict[int, list[str]] = {}
+    for s in segments:
+        minutes.setdefault(int(s.start // 60), []).append(s.text)
+    return "\n".join(f"[{format_timestamp(m * 60)}] {' '.join(texts)}" for m, texts in minutes.items())
+
+
 def build_prompt(transcript: Transcript) -> str:
-    """The message for the model: the JSON it must reply with, then the timestamped transcript."""
+    """The message for the model: the JSON it must reply with, then the transcript, timestamped once a minute."""
     schema = json.dumps(LectureNotes.model_json_schema(), indent=2)
-    lines = [f"[{format_timestamp(s.start)}] {s.text}" for s in transcript.segments]
-    text = "\n".join(lines) or transcript.text
+    text = group_by_minute(transcript.segments) or transcript.text
     return f"Reply with JSON that follows this schema:\n{schema}\n\nLecture transcript:\n{text}"
 
 
@@ -228,11 +266,13 @@ def generate_notes(
                 model=model,
                 messages=messages,
                 format=LectureNotes.model_json_schema(),
-                options={"temperature": 0, "num_predict": MAX_NOTES_TOKENS},
+                options={"temperature": 0, "num_ctx": CONTEXT_TOKENS, "num_predict": MAX_NOTES_TOKENS},
                 think=False,
             )
         except ConnectionError as e:
-            raise NotesGenerationError("Ollama isn't running. Open the Ollama app and try again.") from e
+            raise NotesGenerationError(
+                "Ollama isn't running. Open the Ollama app (or run: ollama serve) and try again."
+            ) from e
         except ollama.ResponseError as e:
             if e.status_code == 404:
                 raise NotesGenerationError(f"{model} isn't downloaded. Run: ollama pull {model}") from e
@@ -277,13 +317,13 @@ def render_markdown(notes: LectureNotes, source: str) -> str:
     return "\n".join(lines)
 
 
-def load_or_transcribe(audio_path: Path, whisper_model: str = DEFAULT_WHISPER_MODEL, language: str | None = None) -> Transcript:
+def load_or_transcribe(audio_path: Path, device: str, language: str | None = None) -> Transcript:
     """Reuse the transcript saved next to the recording, or run Whisper and save one."""
     saved = audio_path.with_suffix(".transcript.json")
     if saved.exists():
         print(f"Using the saved transcript {saved.name} (delete it to transcribe again)")
         return Transcript.model_validate_json(saved.read_text(encoding="utf-8"))
-    transcript = transcribe(audio_path, whisper_model, language)
+    transcript = transcribe(audio_path, device, language)
     saved.write_text(transcript.model_dump_json(indent=2), encoding="utf-8")
     return transcript
 
@@ -302,15 +342,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Turn a lecture recording into study notes.")
     parser.add_argument("audio", type=Path, help="the recording: a .wav, .mp3 or .m4a file")
     parser.add_argument(
-        "--whisper-model",
-        default=DEFAULT_WHISPER_MODEL,
-        help=f"tiny, base, small, medium or turbo (default: {DEFAULT_WHISPER_MODEL})",
+        "--device",
+        required=True,
+        choices=DEVICES,
+        help="where Whisper runs: mac (Apple Silicon GPU), nvidia (NVIDIA GPU) or cpu",
     )
     parser.add_argument("--language", help="the lecture's language, like en or el (default: detect it)")
     args = parser.parse_args()
 
     try:
-        transcript = load_or_transcribe(args.audio, args.whisper_model, args.language)
+        transcript = load_or_transcribe(args.audio, args.device, args.language)
         print(f"Writing notes with {DEFAULT_NOTES_MODEL}...")
         notes = generate_notes(transcript)
         path = save_notes(notes, args.audio)

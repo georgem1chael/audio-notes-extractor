@@ -1,6 +1,8 @@
 """Tests for extract_notes.py. Whisper and Ollama are faked, so they run in about a second."""
 
 import json
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import ollama
@@ -19,6 +21,7 @@ from extract_notes import (
     load_or_transcribe,
     parse_whisper_result,
     render_markdown,
+    run_faster_whisper,
     save_notes,
     validate_audio_path,
 )
@@ -97,13 +100,27 @@ def test_a_broken_segment_is_rejected():
         parse_whisper_result({"text": "hi", "segments": [{"start": -1, "end": 2, "text": "hi"}]})
 
 
+def test_faster_whisper_output_is_converted():
+    segment = SimpleNamespace(start=1.0, end=2.5, text=" Hello.")
+    model = SimpleNamespace(transcribe=lambda *args, **kwargs: (iter([segment]), SimpleNamespace(language="el")))
+    faster_whisper = SimpleNamespace(WhisperModel=lambda *args, **kwargs: model)
+    transcript = parse_whisper_result(run_faster_whisper(faster_whisper, Path("lecture.m4a"), "cpu", None))
+    assert transcript.language == "el"
+    assert transcript.text == "Hello."
+    assert transcript.segments[0].end == 2.5
+
+
 # The model's side, with ollama.chat replaced by a fake
 
 
-def test_the_prompt_has_the_schema_and_timestamps():
-    transcript = Transcript(text="Hello.", segments=[{"start": 65, "end": 70, "text": "Hello."}])
-    prompt = build_prompt(transcript)
-    assert "[00:01:05] Hello." in prompt
+def test_the_prompt_has_the_schema_and_one_timestamp_per_minute():
+    segments = [
+        {"start": 65, "end": 70, "text": "Hello."},
+        {"start": 100, "end": 110, "text": "Welcome."},
+        {"start": 125, "end": 130, "text": "Next."},
+    ]
+    prompt = build_prompt(Transcript(text="Hello. Welcome. Next.", segments=segments))
+    assert "[00:01:00] Hello. Welcome.\n[00:02:00] Next." in prompt
     assert "3-5 questions a student could answer" in prompt
 
 
@@ -175,8 +192,20 @@ def test_a_saved_transcript_is_reused(tmp_path, monkeypatch):
 
     monkeypatch.setattr(extract_notes, "transcribe", fake_transcribe)
     audio = tmp_path / "lecture.m4a"
-    first = load_or_transcribe(audio)
-    second = load_or_transcribe(audio)
+    first = load_or_transcribe(audio, "cpu")
+    second = load_or_transcribe(audio, "cpu")
     assert first == second
     assert len(calls) == 1
     assert (tmp_path / "lecture.transcript.json").exists()
+
+
+# The command line, with Whisper and Ollama faked
+
+
+def test_the_command_line_runs_the_whole_pipeline(tmp_path, monkeypatch):
+    audio = tmp_path / "lecture.m4a"
+    monkeypatch.setattr(sys, "argv", ["lecture-notes", str(audio), "--device", "cpu"])
+    monkeypatch.setattr(extract_notes, "transcribe", lambda *args: TRANSCRIPT)
+    monkeypatch.setattr(ollama, "chat", lambda **kwargs: fake_reply(json.dumps(GOOD_NOTES)))
+    extract_notes.main()
+    assert (tmp_path / "lecture.notes.md").read_text(encoding="utf-8").startswith("# Database normalization")
