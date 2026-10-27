@@ -3,8 +3,10 @@
 Pipeline: audio -> Whisper transcript -> Claude -> notes saved as JSON + Notion.
 """
 
+import argparse
 import json
 import shutil
+import sys
 from pathlib import Path
 from types import ModuleType
 
@@ -291,3 +293,31 @@ def save_notes(notes: LectureNotes, audio_path: Path) -> Path:
     path = audio_path.with_suffix(".notes.md")
     path.write_text(render_markdown(notes, audio_path.name), encoding="utf-8")
     return path
+
+
+# Command Line
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Turn a lecture recording into study notes.")
+    parser.add_argument("audio", type=Path, help="the recording: a .wav, .mp3 or .m4a file")
+    parser.add_argument(
+        "--whisper-model",
+        default=DEFAULT_WHISPER_MODEL,
+        help=f"tiny, base, small, medium or turbo (default: {DEFAULT_WHISPER_MODEL})",
+    )
+    parser.add_argument("--language", help="the lecture's language, like en or el (default: detect it)")
+    args = parser.parse_args()
+
+    try:
+        transcript = load_or_transcribe(args.audio, args.whisper_model, args.language)
+        print(f"Writing notes with {DEFAULT_NOTES_MODEL}...")
+        notes = generate_notes(transcript)
+        path = save_notes(notes, args.audio)
+    except NotesError as e:
+        sys.exit(f"Error: {e}")
+    print(f"Notes saved to {path}")
+
+
+if __name__ == "__main__":
+    main()
